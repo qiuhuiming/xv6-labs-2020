@@ -13,13 +13,32 @@ struct proc proc[NPROC];
 struct proc *initproc;
 
 int nextpid = 1;
+
 struct spinlock pid_lock;
 
+extern char etext[];
+
 extern void forkret(void);
+
+extern pagetable_t kernel_pagetable;
+
+extern pte_t* walk(pagetable_t pagetable, uint64 va, int alloc);
+
 static void wakeup1(struct proc *chan);
+
 static void freeproc(struct proc *p);
 
+void proc_freekpagetable(pagetable_t kpagetable);
+
 extern char trampoline[]; // trampoline.S
+
+pte_t* walk_proc_kpt(uint64 va, int alloc);
+
+pagetable_t proc_kvm_create();
+
+void proc_kvm_map(pagetable_t kp, uint64 va, uint64 pa, uint64 sz, int perm);
+
+void proc_freekpagetable(pagetable_t kp);
 
 // initialize the proc table at boot time.
 void
@@ -34,12 +53,12 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -121,6 +140,25 @@ found:
     return 0;
   }
 
+  // An empty kernel page table
+  p->k_pagetable = proc_kvm_create();
+  if (p->k_pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  // printf("before alloc stack\n");
+  // vmprint(p->k_pagetable);
+  
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int) (p - proc));
+  proc_kvm_map(p->k_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  // printf("after alloc stack\n");
+  // vmprint(p->k_pagetable);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -139,9 +177,29 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+  if (p->kstack) {
+    pte_t *ptep = walk(p->k_pagetable, p->kstack, 0);
+    if (ptep == 0) {
+      panic("freeproc: kstack - ptep=0");
+    }
+    uint64 pa = PTE2PA(*ptep);
+    if (pa == 0) {
+      panic("freeproc: kstack");
+    }
+    kfree((void*) pa);
+  }
+  p->kstack = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+
+  if (p->k_pagetable) {
+    proc_freekpagetable(p->k_pagetable);
+  }
+  p->k_pagetable = 0;
+
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -473,6 +531,9 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -486,6 +547,8 @@ scheduler(void)
 #if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
+      w_satp(MAKE_SATP(kernel_pagetable));
+      sfence_vma();
       asm volatile("wfi");
     }
 #else
@@ -696,4 +759,44 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+pagetable_t proc_kvm_create() {
+  pagetable_t kp = uvmcreate();
+  if (kp == 0) {
+    panic("proc_kvm_create: uvmcreate");
+  }
+  proc_kvm_map(kp, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  proc_kvm_map(kp, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  proc_kvm_map(kp, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  proc_kvm_map(kp, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  proc_kvm_map(kp, KERNBASE, KERNBASE, (uint64) etext - KERNBASE, PTE_R | PTE_X);
+  proc_kvm_map(kp, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  proc_kvm_map(kp, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return kp;
+}
+
+void proc_kvm_map(pagetable_t kp, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(kp, va, sz, pa, perm) != 0) {
+    panic("proc_kvm_map");
+  }
+}
+
+void proc_freekpagetable(pagetable_t pagetable) {
+  for (int i = 0; i < 512; ++i) {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V) {
+      pagetable[i] = 0;
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        uint64 child = PTE2PA(pte);
+        proc_freekpagetable((pagetable_t) child);
+      }
+    }
+  }
+  kfree((void*) pagetable);
+}
+
+pte_t *walk_proc_kpt(uint64 va, int alloc) {
+  return walk(myproc()->k_pagetable, va, alloc);
 }

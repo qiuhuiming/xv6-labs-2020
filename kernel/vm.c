@@ -5,7 +5,6 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
 /*
  * the kernel's page table.
  */
@@ -15,8 +14,9 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
-void 
-vmprint(pagetable_t pgt);
+extern pte_t* walk_proc_kpt(uint64 va, int alloc);
+
+void vmprint(pagetable_t pgt);
 
 /*
  * create a direct-map page table for the kernel.
@@ -135,7 +135,7 @@ kvmpa(uint64 va)
   pte_t *pte;
   uint64 pa;
   
-  pte = walk(kernel_pagetable, va, 0);
+  pte = walk_proc_kpt(va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
