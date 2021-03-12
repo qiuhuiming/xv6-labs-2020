@@ -132,3 +132,19 @@ printfinit(void)
   initlock(&pr.lock, "pr");
   pr.locking = 1;
 }
+
+
+void
+backtrace(void) {
+  uint64 fp = r_fp();
+  uint64 return_address;
+  while (1) {
+    return_address = *(uint64*)(fp - 8);
+    if (PGROUNDDOWN(return_address) < KERNBASE || PGROUNDUP(return_address) >= PHYSTOP) {
+      return;
+    }
+    printf("%p\n", return_address);
+    fp = *(uint64*)(fp - 16);
+  }
+
+}
