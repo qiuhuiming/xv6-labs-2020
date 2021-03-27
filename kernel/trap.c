@@ -68,9 +68,17 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    if (r_scause() == 15 || r_scause() == 13) { // page fault
+      if (lazy_allocate(p, r_stval()) < 0) {
+        p->killed = 1;
+      }
+    } else {
+      p->killed = 1;
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+    }
+
+    // vmprint(p->pagetable);
   }
 
   if(p->killed)
@@ -218,3 +226,28 @@ devintr()
   }
 }
 
+int lazy_allocate(struct proc *p, uint64 va) {
+  // printf("page fault:\nva=%p\nsp=%p\nsz=%p\n", va, p->context.sp, p->sz);
+  // va higher than allocated address or below the user stack
+  if (va >= p->sz || va < p->trapframe->sp) { 
+    return -1;
+  } else {
+    va = PGROUNDDOWN(va);
+
+    void *pa = kalloc();
+    // out of memory
+    if (pa == 0) { 
+      // panic("page fault: cannot allocate physic memory");
+      return -2;
+    } else {
+      memset(pa, 0, PGSIZE);
+      if (mappages(p->pagetable, va, PGSIZE, (uint64)pa, PTE_W|PTE_X|PTE_R|PTE_U) != 0) {
+        kfree(pa);
+        // panic("page fault: cannot map vm to pa");
+        return -3;
+      }
+      // printf("pa: %p\n", pa);
+    }
+  }
+  return 0;
+}
